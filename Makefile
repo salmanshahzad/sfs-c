@@ -1,2 +1,7 @@
+CC = gcc
+CFLAGS = -pedantic -Wall -Wextra -Werror
+LDFLAGS =
+
 all:
-	gcc -o sfs main.c
+	$(CC) -o sfs $(CFLAGS) $(LDFLAGS) main.c
+	strip sfs
