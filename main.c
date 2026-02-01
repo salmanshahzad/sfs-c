@@ -1,10 +1,12 @@
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BUFFER_SIZE 4096
@@ -21,21 +23,21 @@
 
 struct req_thread_args {
     int client_fd;
-    const char *directory;
+    int dir_fd;
 };
 
 struct response {
     int status;
-    void *body;
+    int body_fd;
     size_t content_length;
     const char *content_type;
 };
 
-void decode_path(char *decoded, const char *encoded) {
+void decode_path(char *decoded, size_t decoded_len, const char *encoded) {
     const size_t len = strlen(encoded);
     size_t i = 0;
     size_t j = 0;
-    while (i < len) {
+    while (i < len && j < decoded_len - 1) {
         if (encoded[i] == '%' && i + 2 < len) {
             const char hex[] = { encoded[i + 1], encoded[i + 2], '\0' };
             char *end;
@@ -46,6 +48,8 @@ void decode_path(char *decoded, const char *encoded) {
             } else {
                 decoded[j++] = encoded[i++];
             }
+        } else if (encoded[i] == '?' || encoded[i] == '#') {
+            break;
         } else {
             decoded[j++] = encoded[i++];
         }
@@ -87,24 +91,6 @@ const char *get_mime_type(const char *file) {
     return "application/octet-stream";
 }
 
-bool read_all(FILE *file, char *buf, size_t nbytes) {
-    size_t total_read = 0;
-    while (total_read < nbytes) {
-        const size_t bytes_read = fread(
-            buf + total_read,
-            sizeof(char),
-            nbytes - total_read,
-            file
-        );
-        if (ferror(file) != 0) {
-            perror("fread");
-            return false;
-        }
-        total_read += bytes_read;
-    }
-    return true;
-}
-
 void trim(char **str, char s) {
     const size_t len = strlen(*str);
     if (len == 0) return;
@@ -126,6 +112,19 @@ bool write_all(int fd, const void *data, size_t nbytes) {
         );
         if (bytes_written == -1) {
             perror("write");
+            return false;
+        }
+        total_written += bytes_written;
+    }
+    return true;
+}
+
+bool send_file(int from_fd, int to_fd, off_t nbytes) {
+    off_t total_written = 0;
+    while (total_written < nbytes) {
+        off_t bytes_written = 0;
+        if (sendfile(from_fd, to_fd, total_written, &bytes_written, NULL, 0) == -1) {
+            perror("sendfile");
             return false;
         }
         total_written += bytes_written;
@@ -171,14 +170,13 @@ bool send_response(int fd, const struct response *res) {
         date
     );
     return write_all(fd, headers, headers_len) &&
-        (res->body == NULL || write_all(fd, res->body, res->content_length));
+        (res->body_fd == -1 || send_file(res->body_fd, fd, res->content_length));
 }
 
 void *handle_request(void *_args) {
     struct req_thread_args *args = (struct req_thread_args*)_args;
     struct response res = {0};
-    char *path = NULL;
-    FILE *file = NULL;
+    int fd = -1;
 
     char req[BUFFER_SIZE];
     const ssize_t bytes_read = read(args->client_fd, req, sizeof(req));
@@ -188,15 +186,21 @@ void *handle_request(void *_args) {
         send_response(args->client_fd, &res);
         goto close;
     }
-    req[bytes_read] = '\0';
 
     if (bytes_read == sizeof(req)) {
         res.status = STATUS_URI_TOO_LONG;
         send_response(args->client_fd, &res);
         goto close;
     }
+    req[bytes_read] = '\0';
 
     const char *method = strtok(req, " ");
+    if (method == NULL) {
+        res.status = STATUS_BAD_REQUEST;
+        send_response(args->client_fd, &res);
+        goto close;
+    }
+
     const bool is_method_get = strcmp(method, "GET") == 0;
     const bool is_method_head = strcmp(method, "HEAD") == 0;
     if (!is_method_get && !is_method_head) {
@@ -216,24 +220,24 @@ void *handle_request(void *_args) {
     if (*resource == '\0') {
         resource = "index.html";
     }
-    char decoded_resource[BUFFER_SIZE];
-    decode_path(decoded_resource, resource);
+    char path[BUFFER_SIZE];
+    decode_path(path, sizeof(path), resource);
 
-    path = realpath(decoded_resource, NULL);
-    if (path == NULL) {
+    if (strnstr(path, "..", strlen(path)) != NULL) {
         res.status = STATUS_NOT_FOUND;
         send_response(args->client_fd, &res);
         goto close;
     }
 
-    if (strncmp(args->directory, path, strlen(args->directory)) != 0) {
+    fd = openat(args->dir_fd, path, O_RDONLY);
+    if (fd == -1) {
         res.status = STATUS_NOT_FOUND;
         send_response(args->client_fd, &res);
         goto close;
     }
 
     struct stat st;
-    if (stat(path, &st) == -1) {
+    if (fstat(fd, &st) == -1) {
         perror("stat");
         res.status = STATUS_INTERNAL_SERVER_ERROR;
         send_response(args->client_fd, &res);
@@ -246,63 +250,15 @@ void *handle_request(void *_args) {
         goto close;
     }
 
-    file = fopen(path, "r");
-    if (file == NULL) {
-        perror("fopen");
-        res.status = STATUS_INTERNAL_SERVER_ERROR;
-        send_response(args->client_fd, &res);
-        goto close;
-    }
-
-    if (fseek(file, 0, SEEK_END) == -1) {
-        perror("fseek");
-        res.status = STATUS_INTERNAL_SERVER_ERROR;
-        send_response(args->client_fd, &res);
-        goto close;
-    }
-
-    const long file_size = ftell(file);
-    if (file_size == -1) {
-        perror("ftell");
-        res.status = STATUS_INTERNAL_SERVER_ERROR;
-        send_response(args->client_fd, &res);
-        goto close;
-    }
-
-    if (is_method_get) {
-        res.body = malloc(file_size);
-        if (res.body == NULL) {
-            perror("malloc");
-            res.status = STATUS_INTERNAL_SERVER_ERROR;
-            send_response(args->client_fd, &res);
-            goto close;
-        }
-        if (fseek(file, 0, SEEK_SET) == -1) {
-            perror("fseek");
-            res.status = STATUS_INTERNAL_SERVER_ERROR;
-            send_response(args->client_fd, &res);
-            goto close;
-        }
-        if (!read_all(file, res.body, file_size)) {
-            res.status = STATUS_INTERNAL_SERVER_ERROR;
-            send_response(args->client_fd, &res);
-            goto close;
-        }
-    }
-    res.content_length = file_size;
+    res.content_length = st.st_size;
     res.content_type = get_mime_type(path);
+    res.body_fd = is_method_get ? fd : -1;
     res.status = STATUS_OK;
     send_response(args->client_fd, &res);
 
 close:
-    if (path != NULL) {
-        free(path);
-    }
-    if (file != NULL && fclose(file) == EOF) {
-        perror("fclose");
-    }
-    if (res.body != NULL) {
-        free(res.body);
+    if (fd != -1 && close(fd) == -1) {
+        perror("close");
     }
     if (close(args->client_fd) == -1) {
         perror("close");
@@ -320,7 +276,7 @@ int main(int argc, char **argv) {
     while ((c = getopt(argc, argv, "d:h:p:")) != -1) {
         switch (c) {
             case 'd':
-                directory = realpath(optarg, NULL);
+                directory = optarg;
                 break;
             case 'h':
                 host = optarg;
@@ -331,13 +287,15 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (directory == NULL) {
+    const int dir_fd = open(directory, O_DIRECTORY | O_RDONLY);
+    if (dir_fd == -1) {
         fputs("Invalid directory\n", stderr);
         return EXIT_FAILURE;
     }
 
-    if (chdir(directory) == -1) {
-        perror("chdir");
+    const int port_num = port ? atoi(port) : DEFAULT_PORT;
+    if (port_num < 0 || port_num > 65535) {
+        fputs("Invalid port\n", stderr);
         return EXIT_FAILURE;
     }
 
@@ -349,10 +307,15 @@ int main(int argc, char **argv) {
 
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port ? atoi(port) : DEFAULT_PORT);
+    server_addr.sin_port = htons(port_num);
     if (inet_pton(AF_INET, host, &server_addr.sin_addr) == 0) {
         fputs("Invalid host\n", stderr);
         return EXIT_FAILURE;
+    }
+
+    const int reuse_addr = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) == -1) {
+        perror("setsockopt");
     }
 
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(struct sockaddr_in)) == -1) {
@@ -381,7 +344,7 @@ int main(int argc, char **argv) {
             continue;
         }
         args->client_fd = client_fd;
-        args->directory = directory;
+        args->dir_fd = dir_fd;
 
         pthread_t thread;
         const int err = pthread_create(&thread, NULL, handle_request, args);
